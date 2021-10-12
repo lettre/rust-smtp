@@ -16,6 +16,7 @@ use crate::{address::Envelope, Transport};
 pub struct SmtpTransport {
     #[cfg(feature = "r2d2")]
     inner: Pool<SmtpClient>,
+    get_timeout: Option<Duration>,
     #[cfg(not(feature = "r2d2"))]
     inner: SmtpClient,
 }
@@ -27,7 +28,10 @@ impl Transport for SmtpTransport {
     /// Sends an email
     fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
         #[cfg(feature = "r2d2")]
-        let mut conn = self.inner.get().map_err(error::client)?;
+        let mut conn = match self.get_timeout {
+            None => self.inner.get().map_err(error::client)?,
+            Some(tmo) => self.inner.get_timeout(tmo).map_err(error::client)?,
+        };
         #[cfg(not(feature = "r2d2"))]
         let mut conn = self.inner.connection()?;
 
@@ -179,6 +183,7 @@ impl SmtpTransportBuilder {
         SmtpTransport {
             #[cfg(feature = "r2d2")]
             inner: self.pool_config.build(client),
+            get_timeout: self.pool_config.get_timeout,
             #[cfg(not(feature = "r2d2"))]
             inner: client,
         }

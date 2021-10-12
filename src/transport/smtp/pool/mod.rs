@@ -14,6 +14,7 @@ pub struct PoolConfig {
     max_size: u32,
     connection_timeout: Duration,
     idle_timeout: Duration,
+    pub(crate) get_timeout: Option<Duration>,
 }
 
 impl PoolConfig {
@@ -55,6 +56,14 @@ impl PoolConfig {
         self.idle_timeout = idle_timeout;
         self
     }
+
+    /// Connection get timeout
+    ///
+    /// Defaults to `None`, meaning no timeout.
+    pub fn get_timeout(mut self, get_timeout: Option<Duration>) -> Self {
+        self.get_timeout = get_timeout;
+        self
+    }
 }
 
 impl Default for PoolConfig {
@@ -64,6 +73,7 @@ impl Default for PoolConfig {
             max_size: 10,
             connection_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(60),
+            get_timeout: None,
         }
     }
 }
