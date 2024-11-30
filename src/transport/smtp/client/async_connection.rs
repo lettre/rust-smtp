@@ -237,11 +237,7 @@ impl AsyncSmtpConnection {
     }
 
     pub async fn abort(&mut self) {
-        // Only try to quit if we are not already broken
-        if !self.panic {
-            self.panic = true;
-            let _ = self.command(Quit).await;
-        }
+        self.panic = true;
         let _ = self.stream.close().await;
     }
 

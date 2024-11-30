@@ -178,11 +178,7 @@ impl SmtpConnection {
     }
 
     pub fn abort(&mut self) {
-        // Only try to quit if we are not already broken
-        if !self.panic {
-            self.panic = true;
-            let _ = self.command(Quit);
-        }
+        self.panic = true;
         let _ = self.stream.get_mut().shutdown(std::net::Shutdown::Both);
     }
 
