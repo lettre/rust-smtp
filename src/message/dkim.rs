@@ -108,9 +108,33 @@ pub struct DkimSigningKey(InnerDkimSigningKey);
 enum InnerDkimSigningKey {
     Rsa(RsaPrivateKey),
     Ed25519(ed25519_dalek::SigningKey),
+    #[cfg(feature = "gpgme")]
+    Gnupg(DkimSigningAlgorithm, gpgme::Key),
 }
 
 impl DkimSigningKey {
+    #[cfg(feature = "gpgme")]
+    /// Retrieve the secret key from gnupg using the fingerprint.
+    ///
+    /// Note that even if subkey fingerprint is provided,
+    /// the **key** will be retrieved instead of **subkey**,
+    /// and gpg will select the newest available subkey
+    /// of the key to sign data.
+    pub fn new_gpg(
+        key_fingerprint: impl cstr_argument::CStrArgument,
+    ) -> Result<Self, super::gnupg::GpgGetKeyError> {
+        use super::gnupg::{gpg_key_algorithm, GpgGetKeyError};
+        use gpgme::{Context, Protocol};
+        let mut gpg =
+            Context::from_protocol(Protocol::OpenPgp).map_err(GpgGetKeyError::GpgError)?;
+        let key = gpg
+            .get_secret_key(key_fingerprint)
+            .map_err(GpgGetKeyError::GpgError)?;
+        Ok(DkimSigningKey(InnerDkimSigningKey::Gnupg(
+            gpg_key_algorithm(&key)?,
+            key,
+        )))
+    }
     pub fn new(
         private_key: &str,
         algorithm: DkimSigningAlgorithm,
@@ -138,6 +162,8 @@ impl DkimSigningKey {
         match self.0 {
             InnerDkimSigningKey::Rsa(_) => DkimSigningAlgorithm::Rsa,
             InnerDkimSigningKey::Ed25519(_) => DkimSigningAlgorithm::Ed25519,
+            #[cfg(feature = "gpgme")]
+            InnerDkimSigningKey::Gnupg(algo, _) => algo,
         }
     }
 }
@@ -399,6 +425,10 @@ fn dkim_sign_fixed_time(message: &mut Message, dkim_config: &DkimConfig, timesta
         InnerDkimSigningKey::Ed25519(private_key) => {
             crate::base64::encode(private_key.sign(&hashed_headers).to_bytes())
         }
+        #[cfg(feature = "gpgme")]
+        InnerDkimSigningKey::Gnupg(_, key) => crate::base64::encode(
+            super::gnupg::gpg_sign(key, &hashed_headers).expect("signing failed"),
+        ),
     };
     let dkim_header = dkim_header_format(
         dkim_config,

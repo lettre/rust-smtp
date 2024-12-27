@@ -211,6 +211,8 @@ mod attachment;
 mod body;
 #[cfg(feature = "dkim")]
 pub mod dkim;
+#[cfg(all(feature = "dkim", feature = "gpgme"))]
+pub mod gnupg;
 pub mod header;
 mod mailbox;
 mod mimebody;

@@ -71,6 +71,8 @@ tokio1_boring = { package = "tokio-boring", version = "4", optional = true }
 sha2 = { version = "0.10", optional = true, features = ["oid"] }
 rsa = { version = "0.9", optional = true }
 ed25519-dalek = { version = "2", optional = true }
+gpgme = { version = "0.11", optional = true }
+cstr-argument = { version = "0.1", optional = true }
 
 # email formats
 email_address = { version = "0.2.1", default-features = false }
@@ -121,6 +123,7 @@ tokio1-rustls-tls = ["tokio1", "rustls-tls", "dep:tokio1_rustls"]
 tokio1-boring-tls = ["tokio1", "boring-tls", "dep:tokio1_boring"]
 
 dkim = ["dep:base64", "dep:sha2", "dep:rsa", "dep:ed25519-dalek"]
+gpgme = ["dep:gpgme", "dep:cstr-argument"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(lettre_ignore_tls_mismatch)'] }
