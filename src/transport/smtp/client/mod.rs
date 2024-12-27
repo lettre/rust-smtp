@@ -24,6 +24,8 @@
 
 #[cfg(feature = "serde")]
 use std::fmt::Debug;
+#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+use std::future::Future;
 
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 pub use self::async_connection::AsyncSmtpConnection;
@@ -40,6 +42,7 @@ pub use self::{
     connection::SmtpConnection,
     tls::{Certificate, CertificateStore, Identity, Tls, TlsParameters, TlsParametersBuilder},
 };
+use super::{error, Error};
 
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 mod async_connection;
@@ -48,6 +51,99 @@ mod async_net;
 mod connection;
 mod net;
 mod tls;
+
+#[derive(Debug)]
+pub(super) struct ConnectionWrapper<C> {
+    conn: C,
+    state: ConnectionState,
+}
+
+impl<C> ConnectionWrapper<C> {
+    pub(super) fn new(conn: C) -> Self {
+        Self {
+            conn,
+            state: ConnectionState::ProbablyConnected,
+        }
+    }
+
+    pub(super) fn get_ref(&self) -> &C {
+        &self.conn
+    }
+
+    pub(super) fn get_mut(&mut self) -> &mut C {
+        &mut self.conn
+    }
+
+    pub(super) fn state(&self) -> ConnectionState {
+        self.state
+    }
+
+    pub(super) fn set_state(&mut self, state: ConnectionState) {
+        self.state = state;
+    }
+
+    pub(super) fn sync_op<F, T>(&mut self, f: F) -> Result<T, Error>
+    where
+        F: FnOnce(&mut C) -> Result<T, Error>,
+    {
+        if !matches!(
+            self.state,
+            ConnectionState::ProbablyConnected | ConnectionState::BrokenResponse
+        ) {
+            return Err(error::client(
+                "attempted to send operation to broken connection",
+            ));
+        }
+
+        self.state = ConnectionState::Writing;
+        match f(&mut self.conn) {
+            Ok(t) => {
+                self.state = ConnectionState::ProbablyConnected;
+                Ok(t)
+            }
+            Err(err) => {
+                self.state = ConnectionState::BrokenConnection;
+                Err(err)
+            }
+        }
+    }
+
+    #[cfg(any(feature = "tokio1", feature = "async-std1"))]
+    pub(super) async fn async_op<'a, F, Fut, T>(&'a mut self, f: F) -> Result<T, Error>
+    where
+        F: FnOnce(&'a mut C) -> Fut,
+        Fut: Future<Output = Result<T, Error>>,
+    {
+        if !matches!(
+            self.state,
+            ConnectionState::ProbablyConnected | ConnectionState::BrokenResponse
+        ) {
+            return Err(error::client(
+                "attempted to send operation to broken connection",
+            ));
+        }
+
+        self.state = ConnectionState::Writing;
+        match f(&mut self.conn).await {
+            Ok(t) => {
+                self.state = ConnectionState::ProbablyConnected;
+                Ok(t)
+            }
+            Err(err) => {
+                self.state = ConnectionState::BrokenConnection;
+                Err(err)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(super) enum ConnectionState {
+    ProbablyConnected,
+    Writing,
+    BrokenResponse,
+    BrokenConnection,
+}
 
 /// The codec used for transparency
 #[derive(Debug)]

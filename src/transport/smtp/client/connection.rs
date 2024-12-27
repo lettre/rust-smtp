@@ -7,38 +7,25 @@ use std::{
 
 #[cfg(feature = "tracing")]
 use super::escape_crlf;
-use super::{ClientCodec, NetworkStream, TlsParameters};
+use super::{ClientCodec, ConnectionWrapper, NetworkStream, TlsParameters};
 use crate::{
     address::Envelope,
     transport::smtp::{
         authentication::{Credentials, Mechanism},
+        client::ConnectionState,
         commands::{Auth, Data, Ehlo, Mail, Noop, Quit, Rcpt, Starttls},
-        error,
-        error::Error,
+        error::{self, Error},
         extension::{ClientId, Extension, MailBodyParameter, MailParameter, ServerInfo},
         response::{parse_response, Response},
     },
 };
 
-macro_rules! try_smtp (
-    ($err: expr, $client: ident) => ({
-        match $err {
-            Ok(val) => val,
-            Err(err) => {
-                $client.abort();
-                return Err(From::from(err))
-            },
-        }
-    })
-);
-
 /// Structure that implements the SMTP client
 pub struct SmtpConnection {
     /// TCP stream between client and server
-    /// Value is None before connection
-    stream: BufReader<NetworkStream>,
-    /// Panic state
-    panic: bool,
+    stream: ConnectionWrapper<BufReader<NetworkStream>>,
+    /// Whether QUIT has been sent
+    sent_quit: bool,
     /// Information about the server
     server_info: ServerInfo,
 }
@@ -64,8 +51,8 @@ impl SmtpConnection {
         let stream = NetworkStream::connect(server, timeout, tls_parameters, local_address)?;
         let stream = BufReader::new(stream);
         let mut conn = SmtpConnection {
-            stream,
-            panic: false,
+            stream: ConnectionWrapper::new(stream),
+            sent_quit: false,
             server_info: ServerInfo::default(),
         };
         conn.set_timeout(timeout).map_err(error::network)?;
@@ -110,26 +97,27 @@ impl SmtpConnection {
             mail_options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
         }
 
-        try_smtp!(
-            self.command(Mail::new(envelope.from().cloned(), mail_options)),
-            self
-        );
+        self.command(Mail::new(envelope.from().cloned(), mail_options))?;
 
         // Recipient
         for to_address in envelope.to() {
-            try_smtp!(self.command(Rcpt::new(to_address.clone(), vec![])), self);
+            self.command(Rcpt::new(to_address.clone(), vec![]))?;
         }
 
         // Data
-        try_smtp!(self.command(Data), self);
+        self.command(Data)?;
 
         // Message content
-        let result = try_smtp!(self.message(email), self);
+        let result = self.message(email)?;
         Ok(result)
     }
 
     pub fn has_broken(&self) -> bool {
-        self.panic
+        self.sent_quit
+            || matches!(
+                self.stream.state(),
+                ConnectionState::BrokenConnection | ConnectionState::BrokenResponse
+            )
     }
 
     pub fn can_starttls(&self) -> bool {
@@ -145,12 +133,13 @@ impl SmtpConnection {
         if self.server_info.supports_feature(Extension::StartTls) {
             #[cfg(any(feature = "native-tls", feature = "rustls-tls", feature = "boring-tls"))]
             {
-                try_smtp!(self.command(Starttls), self);
-                self.stream.get_mut().upgrade_tls(tls_parameters)?;
+                self.command(Starttls)?;
+                self.stream
+                    .sync_op(|stream| stream.get_mut().upgrade_tls(tls_parameters))?;
                 #[cfg(feature = "tracing")]
                 tracing::debug!("connection encrypted");
                 // Send EHLO again
-                try_smtp!(self.ehlo(hello_name), self);
+                self.ehlo(hello_name)?;
                 Ok(())
             }
             #[cfg(not(any(
@@ -168,38 +157,47 @@ impl SmtpConnection {
 
     /// Send EHLO and update server info
     fn ehlo(&mut self, hello_name: &ClientId) -> Result<(), Error> {
-        let ehlo_response = try_smtp!(self.command(Ehlo::new(hello_name.clone())), self);
-        self.server_info = try_smtp!(ServerInfo::from_response(&ehlo_response), self);
+        let ehlo_response = self.command(Ehlo::new(hello_name.clone()))?;
+        self.server_info = ServerInfo::from_response(&ehlo_response)?;
         Ok(())
     }
 
     pub fn quit(&mut self) -> Result<Response, Error> {
-        Ok(try_smtp!(self.command(Quit), self))
+        self.sent_quit = true;
+        self.command(Quit)
     }
 
     pub fn abort(&mut self) {
         // Only try to quit if we are not already broken
-        if !self.panic {
-            self.panic = true;
-            let _ = self.command(Quit);
+        // `write` already rejects writes if the connection state if bad
+        if !self.sent_quit {
+            let _ = self.quit();
         }
-        let _ = self.stream.get_mut().shutdown(std::net::Shutdown::Both);
+
+        if !matches!(self.stream.state(), ConnectionState::BrokenConnection) {
+            let _ = self.stream.sync_op(|stream| {
+                stream
+                    .get_mut()
+                    .shutdown(std::net::Shutdown::Both)
+                    .map_err(error::network)
+            });
+        }
     }
 
     /// Sets the underlying stream
     pub fn set_stream(&mut self, stream: NetworkStream) {
-        self.stream = BufReader::new(stream);
+        self.stream = ConnectionWrapper::new(BufReader::new(stream));
     }
 
     /// Tells if the underlying stream is currently encrypted
     pub fn is_encrypted(&self) -> bool {
-        self.stream.get_ref().is_encrypted()
+        self.stream.get_ref().get_ref().is_encrypted()
     }
 
     /// Set timeout
     pub fn set_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
-        self.stream.get_mut().set_read_timeout(duration)?;
-        self.stream.get_mut().set_write_timeout(duration)
+        self.stream.get_mut().get_mut().set_read_timeout(duration)?;
+        self.stream.get_mut().get_mut().set_write_timeout(duration)
     }
 
     /// Checks if the server is connected using the NOOP SMTP command
@@ -224,14 +222,11 @@ impl SmtpConnection {
 
         while challenges > 0 && response.has_code(334) {
             challenges -= 1;
-            response = try_smtp!(
-                self.command(Auth::new_from_response(
-                    mechanism,
-                    credentials.clone(),
-                    &response,
-                )?),
-                self
-            );
+            response = self.command(Auth::new_from_response(
+                mechanism,
+                credentials.clone(),
+                &response,
+            )?)?;
         }
 
         if challenges == 0 {
@@ -261,10 +256,9 @@ impl SmtpConnection {
     /// Writes a string to the server
     fn write(&mut self, string: &[u8]) -> Result<(), Error> {
         self.stream
-            .get_mut()
-            .write_all(string)
-            .map_err(error::network)?;
-        self.stream.get_mut().flush().map_err(error::network)?;
+            .sync_op(|stream| stream.get_mut().write_all(string).map_err(error::network))?;
+        self.stream
+            .sync_op(|stream| stream.get_mut().flush().map_err(error::network))?;
 
         #[cfg(feature = "tracing")]
         tracing::debug!("Wrote: {}", escape_crlf(&String::from_utf8_lossy(string)));
@@ -275,7 +269,11 @@ impl SmtpConnection {
     pub fn read_response(&mut self) -> Result<Response, Error> {
         let mut buffer = String::with_capacity(100);
 
-        while self.stream.read_line(&mut buffer).map_err(error::network)? > 0 {
+        while self
+            .stream
+            .sync_op(|stream| stream.read_line(&mut buffer).map_err(error::network))?
+            > 0
+        {
             #[cfg(feature = "tracing")]
             tracing::debug!("<< {}", escape_crlf(&buffer));
             match parse_response(&buffer) {
@@ -290,10 +288,12 @@ impl SmtpConnection {
                     };
                 }
                 Err(nom::Err::Failure(e)) => {
+                    self.stream.set_state(ConnectionState::BrokenResponse);
                     return Err(error::response(e.to_string()));
                 }
                 Err(nom::Err::Incomplete(_)) => { /* read more */ }
                 Err(nom::Err::Error(e)) => {
+                    self.stream.set_state(ConnectionState::BrokenResponse);
                     return Err(error::response(e.to_string()));
                 }
             }
@@ -305,12 +305,12 @@ impl SmtpConnection {
     /// The X509 certificate of the server (DER encoded)
     #[cfg(any(feature = "native-tls", feature = "rustls-tls", feature = "boring-tls"))]
     pub fn peer_certificate(&self) -> Result<Vec<u8>, Error> {
-        self.stream.get_ref().peer_certificate()
+        self.stream.get_ref().get_ref().peer_certificate()
     }
 
     /// All the X509 certificates of the chain (DER encoded)
     #[cfg(any(feature = "rustls-tls", feature = "boring-tls"))]
     pub fn certificate_chain(&self) -> Result<Vec<Vec<u8>>, Error> {
-        self.stream.get_ref().certificate_chain()
+        self.stream.get_ref().get_ref().certificate_chain()
     }
 }

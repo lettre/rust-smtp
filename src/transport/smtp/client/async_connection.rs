@@ -10,34 +10,21 @@ use super::{AsyncNetworkStream, ClientCodec, TlsParameters};
 use crate::{
     transport::smtp::{
         authentication::{Credentials, Mechanism},
+        client::{ConnectionState, ConnectionWrapper},
         commands::{Auth, Data, Ehlo, Mail, Noop, Quit, Rcpt, Starttls},
-        error,
-        error::Error,
+        error::{self, Error},
         extension::{ClientId, Extension, MailBodyParameter, MailParameter, ServerInfo},
         response::{parse_response, Response},
     },
     Envelope,
 };
 
-macro_rules! try_smtp (
-    ($err: expr, $client: ident) => ({
-        match $err {
-            Ok(val) => val,
-            Err(err) => {
-                $client.abort().await;
-                return Err(From::from(err))
-            },
-        }
-    })
-);
-
 /// Structure that implements the SMTP client
 pub struct AsyncSmtpConnection {
     /// TCP stream between client and server
-    /// Value is None before connection
-    stream: BufReader<AsyncNetworkStream>,
-    /// Panic state
-    panic: bool,
+    stream: ConnectionWrapper<BufReader<AsyncNetworkStream>>,
+    /// Whether QUIT has been sent
+    sent_quit: bool,
     /// Information about the server
     server_info: ServerInfo,
 }
@@ -125,8 +112,8 @@ impl AsyncSmtpConnection {
     ) -> Result<AsyncSmtpConnection, Error> {
         let stream = BufReader::new(stream);
         let mut conn = AsyncSmtpConnection {
-            stream,
-            panic: false,
+            stream: ConnectionWrapper::new(stream),
+            sent_quit: false,
             server_info: ServerInfo::default(),
         };
         // TODO log
@@ -170,30 +157,28 @@ impl AsyncSmtpConnection {
             mail_options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
         }
 
-        try_smtp!(
-            self.command(Mail::new(envelope.from().cloned(), mail_options))
-                .await,
-            self
-        );
+        self.command(Mail::new(envelope.from().cloned(), mail_options))
+            .await?;
 
         // Recipient
         for to_address in envelope.to() {
-            try_smtp!(
-                self.command(Rcpt::new(to_address.clone(), vec![])).await,
-                self
-            );
+            self.command(Rcpt::new(to_address.clone(), vec![])).await?;
         }
 
         // Data
-        try_smtp!(self.command(Data).await, self);
+        self.command(Data).await?;
 
         // Message content
-        let result = try_smtp!(self.message(email).await, self);
+        let result = self.message(email).await?;
         Ok(result)
     }
 
     pub fn has_broken(&self) -> bool {
-        self.panic
+        self.sent_quit
+            || matches!(
+                self.stream.state(),
+                ConnectionState::BrokenConnection | ConnectionState::BrokenResponse
+            )
     }
 
     pub fn can_starttls(&self) -> bool {
@@ -213,12 +198,14 @@ impl AsyncSmtpConnection {
         hello_name: &ClientId,
     ) -> Result<(), Error> {
         if self.server_info.supports_feature(Extension::StartTls) {
-            try_smtp!(self.command(Starttls).await, self);
-            self.stream.get_mut().upgrade_tls(tls_parameters).await?;
+            self.command(Starttls).await?;
+            self.stream
+                .async_op(|stream| stream.get_mut().upgrade_tls(tls_parameters))
+                .await?;
             #[cfg(feature = "tracing")]
             tracing::debug!("connection encrypted");
             // Send EHLO again
-            try_smtp!(self.ehlo(hello_name).await, self);
+            self.ehlo(hello_name).await?;
             Ok(())
         } else {
             Err(error::client("STARTTLS is not supported on this server"))
@@ -227,32 +214,39 @@ impl AsyncSmtpConnection {
 
     /// Send EHLO and update server info
     async fn ehlo(&mut self, hello_name: &ClientId) -> Result<(), Error> {
-        let ehlo_response = try_smtp!(self.command(Ehlo::new(hello_name.clone())).await, self);
-        self.server_info = try_smtp!(ServerInfo::from_response(&ehlo_response), self);
+        let ehlo_response = self.command(Ehlo::new(hello_name.clone())).await?;
+        self.server_info = ServerInfo::from_response(&ehlo_response)?;
         Ok(())
     }
 
     pub async fn quit(&mut self) -> Result<Response, Error> {
-        Ok(try_smtp!(self.command(Quit).await, self))
+        self.sent_quit = true;
+        self.command(Quit).await
     }
 
     pub async fn abort(&mut self) {
         // Only try to quit if we are not already broken
-        if !self.panic {
-            self.panic = true;
-            let _ = self.command(Quit).await;
+        // `write` already rejects writes if the connection state if bad
+        if !self.sent_quit {
+            let _ = self.quit().await;
         }
-        let _ = self.stream.close().await;
+
+        if !matches!(self.stream.state(), ConnectionState::BrokenConnection) {
+            let _ = self
+                .stream
+                .async_op(|stream| async { stream.close().await.map_err(error::network) })
+                .await;
+        }
     }
 
     /// Sets the underlying stream
     pub fn set_stream(&mut self, stream: AsyncNetworkStream) {
-        self.stream = BufReader::new(stream);
+        self.stream = ConnectionWrapper::new(BufReader::new(stream));
     }
 
     /// Tells if the underlying stream is currently encrypted
     pub fn is_encrypted(&self) -> bool {
-        self.stream.get_ref().is_encrypted()
+        self.stream.get_ref().get_ref().is_encrypted()
     }
 
     /// Checks if the server is connected using the NOOP SMTP command
@@ -279,15 +273,13 @@ impl AsyncSmtpConnection {
 
         while challenges > 0 && response.has_code(334) {
             challenges -= 1;
-            response = try_smtp!(
-                self.command(Auth::new_from_response(
+            response = self
+                .command(Auth::new_from_response(
                     mechanism,
                     credentials.clone(),
                     &response,
                 )?)
-                .await,
-                self
-            );
+                .await?;
         }
 
         if challenges == 0 {
@@ -316,15 +308,17 @@ impl AsyncSmtpConnection {
     /// Writes a string to the server
     async fn write(&mut self, string: &[u8]) -> Result<(), Error> {
         self.stream
-            .get_mut()
-            .write_all(string)
-            .await
-            .map_err(error::network)?;
+            .async_op(|stream| async {
+                stream
+                    .get_mut()
+                    .write_all(string)
+                    .await
+                    .map_err(error::network)
+            })
+            .await?;
         self.stream
-            .get_mut()
-            .flush()
-            .await
-            .map_err(error::network)?;
+            .async_op(|stream| async { stream.get_mut().flush().await.map_err(error::network) })
+            .await?;
 
         #[cfg(feature = "tracing")]
         tracing::debug!("Wrote: {}", escape_crlf(&String::from_utf8_lossy(string)));
@@ -337,9 +331,10 @@ impl AsyncSmtpConnection {
 
         while self
             .stream
-            .read_line(&mut buffer)
-            .await
-            .map_err(error::network)?
+            .async_op(|stream| async {
+                stream.read_line(&mut buffer).await.map_err(error::network)
+            })
+            .await?
             > 0
         {
             #[cfg(feature = "tracing")]
@@ -356,10 +351,12 @@ impl AsyncSmtpConnection {
                     }
                 }
                 Err(nom::Err::Failure(e)) => {
+                    self.stream.set_state(ConnectionState::BrokenResponse);
                     return Err(error::response(e.to_string()));
                 }
                 Err(nom::Err::Incomplete(_)) => { /* read more */ }
                 Err(nom::Err::Error(e)) => {
+                    self.stream.set_state(ConnectionState::BrokenResponse);
                     return Err(error::response(e.to_string()));
                 }
             }
@@ -371,12 +368,12 @@ impl AsyncSmtpConnection {
     /// The X509 certificate of the server (DER encoded)
     #[cfg(any(feature = "native-tls", feature = "rustls-tls", feature = "boring-tls"))]
     pub fn peer_certificate(&self) -> Result<Vec<u8>, Error> {
-        self.stream.get_ref().peer_certificate()
+        self.stream.get_ref().get_ref().peer_certificate()
     }
 
     /// All the X509 certificates of the chain (DER encoded)
     #[cfg(any(feature = "rustls-tls", feature = "boring-tls"))]
     pub fn certificate_chain(&self) -> Result<Vec<Vec<u8>>, Error> {
-        self.stream.get_ref().certificate_chain()
+        self.stream.get_ref().get_ref().certificate_chain()
     }
 }
